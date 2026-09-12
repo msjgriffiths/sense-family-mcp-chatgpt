@@ -1,0 +1,14 @@
+{
+  "Rules": [
+    {
+      "ID": "ExpireOldBuildArtifacts",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "releases/"
+      },
+      "Expiration": {
+        "Days": 30
+      }
+    }
+  ]
+}

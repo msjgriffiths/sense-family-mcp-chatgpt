@@ -1,0 +1,23 @@
+{
+  "name": "sense-mcp-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OAuth-protected, least-privilege gateway from ChatGPT to the Sense MCP server",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && esbuild src/index.mjs --bundle --platform=node --target=node22 --format=cjs --outfile=dist/index.cjs",
+    "test": "node --test",
+    "check": "npm test && npm run build"
+  },
+  "dependencies": {
+    "@aws-sdk/client-ssm": "3.1130.0",
+    "jose": "6.2.12"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

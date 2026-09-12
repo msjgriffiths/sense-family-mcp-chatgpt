@@ -1,0 +1,360 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: OAuth-protected, least-privilege gateway from ChatGPT to Sense MCP
+
+Parameters:
+  McpResourceUrl:
+    Type: String
+    Default: https://placeholder.invalid/mcp
+    Description: Canonical public MCP URL used for OAuth resource binding
+  PrimaryCallbackUrl:
+    Type: String
+    Default: https://chatgpt.com/
+    Description: Exact OAuth callback URL shown by the primary ChatGPT account
+  PartnerCallbackUrl:
+    Type: String
+    Default: https://chatgpt.com/
+    Description: Exact OAuth callback URL shown by the partner ChatGPT account
+  PrimaryUsername:
+    Type: String
+    Default: primary
+  PartnerUsername:
+    Type: String
+    Default: partner
+  PrimaryKeyParameter:
+    Type: String
+    Default: /sense-mcp/primary/key
+  PartnerKeyParameter:
+    Type: String
+    Default: /sense-mcp/partner/key
+  BudgetEmail:
+    Type: String
+    Default: ""
+    Description: Optional address for the USD 1 monthly cost alert
+  EnableWrites:
+    Type: String
+    Default: "false"
+    AllowedValues: ["false", "true"]
+
+Conditions:
+  HasBudgetEmail: !Not [!Equals [!Ref BudgetEmail, ""]]
+  WritesEnabled: !Equals [!Ref EnableWrites, "true"]
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      UserPoolTier: ESSENTIALS
+      DeletionProtection: ACTIVE
+      UsernameConfiguration:
+        CaseSensitive: false
+      AliasAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      MfaConfiguration: "ON"
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 14
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 7
+      UserPoolTags:
+        Project: sense-mcp
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub sense-mcp-${AWS::AccountId}-${AWS::Region}
+      # OAuth resource indicators are honored by Cognito managed login, but
+      # not by the classic hosted UI. Version 2 makes access tokens carry the
+      # MCP resource URL in their aud claim.
+      ManagedLoginVersion: 2
+      UserPoolId: !Ref UserPool
+
+  ResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      # Cognito requires every requested custom scope to belong to the same
+      # URL resource supplied in the OAuth resource parameter.
+      Identifier: !Ref McpResourceUrl
+      Name: Sense MCP Gateway
+      UserPoolId: !Ref UserPool
+      Scopes:
+        - ScopeName: read
+          ScopeDescription: Read allowlisted Sense calendar and reminder data
+        - ScopeName: write
+          ScopeDescription: Use separately enabled non-delete Sense mutations
+
+  PrimaryAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: chatgpt-primary
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - !Sub ${McpResourceUrl}/read
+        - !If [WritesEnabled, !Sub "${McpResourceUrl}/write", !Ref AWS::NoValue]
+      CallbackURLs:
+        - !Ref PrimaryCallbackUrl
+      SupportedIdentityProviders:
+        - COGNITO
+      EnableTokenRevocation: true
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      RefreshTokenRotation:
+        Feature: ENABLED
+        RetryGracePeriodSeconds: 10
+
+  PartnerAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: chatgpt-partner
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - !Sub ${McpResourceUrl}/read
+        - !If [WritesEnabled, !Sub "${McpResourceUrl}/write", !Ref AWS::NoValue]
+      CallbackURLs:
+        - !Ref PartnerCallbackUrl
+      SupportedIdentityProviders:
+        - COGNITO
+      EnableTokenRevocation: true
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      RefreshTokenRotation:
+        Feature: ENABLED
+        RetryGracePeriodSeconds: 10
+
+  PrimaryManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    DependsOn: UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientId: !Ref PrimaryAppClient
+      UseCognitoProvidedValues: true
+
+  PartnerManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    DependsOn: UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientId: !Ref PartnerAppClient
+      UseCognitoProvidedValues: true
+
+  GatewayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-gateway
+      Description: OAuth and allowlist gateway for the Sense MCP server
+      CodeUri: dist/
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Architectures:
+        - arm64
+      MemorySize: 256
+      Timeout: 30
+      ReservedConcurrentExecutions: 5
+      RecursiveLoop: Terminate
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: BUFFERED
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+      Environment:
+        Variables:
+          COGNITO_ISSUER: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+          COGNITO_DOMAIN: !Sub https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+          CLIENT_BINDINGS: !Sub '{"${PrimaryAppClient}":{"username":"${PrimaryUsername}","parameter":"${PrimaryKeyParameter}"},"${PartnerAppClient}":{"username":"${PartnerUsername}","parameter":"${PartnerKeyParameter}"}}'
+          READ_SCOPE: !Sub ${McpResourceUrl}/read
+          WRITE_SCOPE: !Sub ${McpResourceUrl}/write
+          ENABLE_WRITES: !Ref EnableWrites
+          SENSE_MCP_URL: https://api.getsense.ai/mcp/
+          ALLOWED_ORIGINS: https://chatgpt.com,https://chat.openai.com
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: ReadOnlyMappedSenseKeys
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PrimaryKeyParameter}
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PartnerKeyParameter}
+      Tags:
+        Project: sense-mcp
+
+  GatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-gateway
+      RetentionInDays: 7
+
+  PublicHostFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub ${AWS::StackName}-public-host
+      AutoPublish: true
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var host = request.headers.host;
+          if (host && host.value) {
+            request.headers['x-public-host'] = { value: host.value.toLowerCase() };
+          }
+          return request;
+        }
+      FunctionConfig:
+        Comment: Overwrite the canonical public host passed to the Lambda origin
+        Runtime: cloudfront-js-2.0
+
+  OAuthChallengeFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub ${AWS::StackName}-oauth-challenge
+      AutoPublish: true
+      FunctionCode: |
+        function handler(event) {
+          var response = event.response;
+          var headers = response.headers;
+          var status = headers['x-mcp-proxy-status'];
+          var challenge = headers['x-mcp-www-authenticate'];
+          if (status && challenge) {
+            response.statusCode = parseInt(status.value, 10);
+            response.statusDescription = response.statusCode === 401 ? 'Unauthorized' : 'Forbidden';
+            headers['www-authenticate'] = { value: challenge.value };
+            delete headers['x-mcp-proxy-status'];
+            delete headers['x-mcp-www-authenticate'];
+          }
+          return response;
+        }
+      FunctionConfig:
+        Comment: Restore standards-compliant OAuth challenge responses
+        Runtime: cloudfront-js-2.0
+
+  GatewayDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub ${AWS::StackName} OAuth-safe MCP endpoint
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: LambdaFunctionUrl
+            DomainName: !Select [2, !Split ['/', !GetAtt GatewayFunctionUrl.FunctionUrl]]
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: LambdaFunctionUrl
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          Compress: false
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt PublicHostFunction.FunctionARN
+            - EventType: viewer-response
+              FunctionARN: !GetAtt OAuthChallengeFunction.FunctionARN
+
+  MonthlyCostBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasBudgetEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub ${AWS::StackName}-monthly-1-usd
+        BudgetLimit:
+          Amount: 1
+          Unit: USD
+        BudgetType: COST
+        TimeUnit: MONTHLY
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref BudgetEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: FORECASTED
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref BudgetEmail
+              SubscriptionType: EMAIL
+
+Outputs:
+  McpUrl:
+    Description: URL to enter in ChatGPT
+    Value: !Sub https://${GatewayDistribution.DomainName}/mcp
+  ProtectedResourceMetadataUrl:
+    Value: !Sub https://${GatewayDistribution.DomainName}/.well-known/oauth-protected-resource/mcp
+  CognitoIssuer:
+    Value: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+  AuthorizationServer:
+    Value: !Sub https://${GatewayDistribution.DomainName}/oauth
+  CognitoDomain:
+    Value: !Sub https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+  UserPoolId:
+    Value: !Ref UserPool
+  PrimaryClientId:
+    Value: !Ref PrimaryAppClient
+  PartnerClientId:
+    Value: !Ref PartnerAppClient
