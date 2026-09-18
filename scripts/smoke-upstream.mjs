@@ -1,9 +1,17 @@
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { GetParameterCommand, SSMClient } from "@aws-sdk/client-ssm";
 
 const profile = "sense-mcp";
 const region = "us-east-2";
-const awsCli = process.env.AWS_CLI_PATH ?? "C:\\Program Files\\Amazon\\AWSCLIV2\\aws.exe";
+const awsCli = [
+  process.env.AWS_CLI_PATH,
+  process.env.LOCALAPPDATA
+    ? `${process.env.LOCALAPPDATA}\\Programs\\Amazon\\AWSCLI-2.36.47-portable\\aws.exe`
+    : null,
+  "C:\\Program Files\\Amazon\\AWSCLIV2\\aws.exe",
+].find((candidate) => candidate && existsSync(candidate));
+if (!awsCli) throw new Error("AWS CLI was not found");
 const exported = JSON.parse(
   execFileSync(
     awsCli,
@@ -52,7 +60,14 @@ const initialized = await rpc(1, "initialize", {
 });
 const listed = await rpc(2, "tools/list");
 const toolNames = new Set(listed.result?.tools?.map((tool) => tool.name));
-const required = ["get_events", "create_event", "update_event", "create_reminder"];
+const required = [
+  "get_events",
+  "create_event",
+  "get_saved_recipes",
+  "get_recipe_details",
+  "save_recipe",
+  "update_recipe",
+];
 
 console.log(JSON.stringify({
   server: initialized.result?.serverInfo?.name,

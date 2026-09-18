@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createGateway, READ_TOOLS, WRITE_TOOLS } from "../src/core.mjs";
+import { createGateway } from "../src/core.mjs";
 
 const DOMAIN = "example.lambda-url.us-east-2.on.aws";
 const RESOURCE = `https://${DOMAIN}/mcp`;
@@ -8,6 +8,31 @@ const PUBLIC_DOMAIN = "example.cloudfront.net";
 const PUBLIC_RESOURCE = `https://${PUBLIC_DOMAIN}/mcp`;
 const CLIENT_ID = "client-primary";
 const USERNAME = "primary";
+const UPSTREAM_TOOLS = [
+  {
+    name: "get_events",
+    description: "Read events",
+    inputSchema: { type: "object" },
+    annotations: { readOnlyHint: true, destructiveHint: false },
+  },
+  {
+    name: "get_saved_recipes",
+    description: "Read recipes",
+    inputSchema: { type: "object" },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "update_recipe",
+    description: "Update a recipe",
+    inputSchema: { type: "object" },
+    annotations: { readOnlyHint: false },
+  },
+  {
+    name: "future_sense_tool",
+    description: "A tool added upstream after this gateway was deployed",
+    inputSchema: { type: "object" },
+  },
+];
 
 function event({
   method = "POST",
@@ -57,7 +82,7 @@ function harness(overrides = {}) {
         sub: "opaque-user-subject",
         client_id: CLIENT_ID,
         username: USERNAME,
-        scope: "sense-mcp/read",
+        scope: "sense-mcp/read sense-mcp/write",
         token_use: "access",
       };
     },
@@ -71,11 +96,7 @@ function harness(overrides = {}) {
         jsonrpc: "2.0",
         id: 1,
         result: {
-          tools: [
-            ...READ_TOOLS.map((name) => ({ name, description: name, inputSchema: { type: "object" } })),
-            ...WRITE_TOOLS.map((name) => ({ name, description: name, inputSchema: { type: "object" } })),
-            { name: "delete_everything", inputSchema: { type: "object" } },
-          ],
+          tools: UPSTREAM_TOOLS,
         },
       });
     },
@@ -96,7 +117,7 @@ test("serves RFC 9728 protected-resource metadata without authentication", async
   const body = JSON.parse(result.body);
   assert.equal(body.resource, RESOURCE);
   assert.deepEqual(body.authorization_servers, [`https://${DOMAIN}/oauth`]);
-  assert.deepEqual(body.scopes_supported, ["sense-mcp/read"]);
+  assert.deepEqual(body.scopes_supported, ["sense-mcp/read", "sense-mcp/write"]);
 });
 
 test("publishes ChatGPT-compatible OAuth metadata for Cognito PKCE", async () => {
@@ -114,7 +135,7 @@ test("publishes ChatGPT-compatible OAuth metadata for Cognito PKCE", async () =>
   assert.equal(body.revocation_endpoint, `https://${DOMAIN}/oauth/revoke`);
   assert.deepEqual(body.code_challenge_methods_supported, ["S256"]);
   assert.deepEqual(body.token_endpoint_auth_methods_supported, ["none"]);
-  assert.deepEqual(body.scopes_supported, ["sense-mcp/read"]);
+  assert.deepEqual(body.scopes_supported, ["sense-mcp/read", "sense-mcp/write"]);
   assert.equal("authorization_response_iss_parameter_supported" in body, false);
   assert.equal(body.scopes_supported.includes("offline_access"), false);
 });
@@ -222,7 +243,7 @@ test("uses the CloudFront host as the protected resource audience", async () => 
         sub: "opaque-user-subject",
         client_id: CLIENT_ID,
         username: USERNAME,
-        scope: "sense-mcp/read",
+        scope: "sense-mcp/read sense-mcp/write",
       };
     },
   });
@@ -230,16 +251,20 @@ test("uses the CloudFront host as the protected resource audience", async () => 
   assert.equal(result.statusCode, 200);
 });
 
-test("filters tools/list and adds matching OAuth security schemes", async () => {
+test("passes through every upstream tool and adds the gateway OAuth scheme", async () => {
   const { handler } = harness();
   const result = await handler(event());
   assert.equal(result.statusCode, 200);
   const tools = JSON.parse(result.body).result.tools;
-  assert.deepEqual(tools.map((tool) => tool.name), READ_TOOLS);
+  assert.deepEqual(tools.map((tool) => tool.name), UPSTREAM_TOOLS.map((tool) => tool.name));
   for (const tool of tools) {
-    assert.deepEqual(tool.securitySchemes, [{ type: "oauth2", scopes: ["sense-mcp/read"] }]);
-    assert.equal(tool.annotations.readOnlyHint, true);
+    assert.deepEqual(tool.securitySchemes, [{
+      type: "oauth2",
+      scopes: ["sense-mcp/read", "sense-mcp/write"],
+    }]);
   }
+  assert.deepEqual(tools[0].annotations, UPSTREAM_TOOLS[0].annotations);
+  assert.equal(tools[3].annotations, undefined);
 });
 
 test("replaces inbound OAuth token with the selected Sense key", async () => {
@@ -254,71 +279,44 @@ test("replaces inbound OAuth token with the selected Sense key", async () => {
   assert.doesNotMatch(JSON.stringify(logs), /test-sense-key-not-a-secret/);
 });
 
-test("blocks guessed tools before contacting Sense", async () => {
+test("requires the full-access scopes before contacting Sense", async () => {
+  const { handler, calls } = harness({
+    verifyAccessToken: async () => ({
+      sub: "opaque-user-subject",
+      client_id: CLIENT_ID,
+      username: USERNAME,
+      scope: "sense-mcp/read",
+    }),
+  });
+  const result = await handler(event());
+  assert.equal(result.statusCode, 403);
+  assert.equal(JSON.parse(result.body).error, "insufficient_scope");
+  assert.equal(calls.length, 0);
+});
+
+test("forwards any authenticated upstream tool without a gateway allowlist", async () => {
   const { handler, calls } = harness();
   const result = await handler(event({
     body: {
       jsonrpc: "2.0",
       id: 44,
       method: "tools/call",
-      params: { name: "delete_everything", arguments: {} },
+      params: { name: "future_sense_tool", arguments: { arbitrary: true } },
     },
   }));
   assert.equal(result.statusCode, 200);
-  assert.equal(JSON.parse(result.body).error.code, -32601);
-  assert.equal(calls.length, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(JSON.parse(calls[0].options.body).params.name, "future_sense_tool");
 });
 
-test("keeps writes disabled even when the token contains write scope", async () => {
-  const { handler, calls } = harness({
-    verifyAccessToken: async () => ({
-      sub: "opaque-user-subject",
-      client_id: CLIENT_ID,
-      username: USERNAME,
-      scope: "sense-mcp/read sense-mcp/write",
-    }),
-  });
+test("forwards MCP methods added upstream without a gateway method allowlist", async () => {
+  const { handler, calls } = harness();
   const result = await handler(event({
-    body: {
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: { name: "create_event", arguments: { title: "private data" } },
-    },
+    body: { jsonrpc: "2.0", id: 45, method: "resources/list", params: {} },
   }));
-  assert.equal(JSON.parse(result.body).error.code, -32601);
-  assert.equal(calls.length, 0);
-});
-
-test("allows the narrow write set only when deployment and OAuth scope both enable it", async () => {
-  const { handler, calls } = harness({
-    enableWrites: true,
-    verifyAccessToken: async () => ({
-      sub: "opaque-user-subject",
-      client_id: CLIENT_ID,
-      username: USERNAME,
-      scope: "sense-mcp/read sense-mcp/write",
-    }),
-  });
-
-  const listed = await handler(event());
-  const tools = JSON.parse(listed.body).result.tools;
-  assert.deepEqual(tools.map((tool) => tool.name), [...READ_TOOLS, ...WRITE_TOOLS]);
-  for (const tool of tools.filter((candidate) => WRITE_TOOLS.includes(candidate.name))) {
-    assert.deepEqual(tool.securitySchemes, [{ type: "oauth2", scopes: ["sense-mcp/write"] }]);
-    assert.equal(tool.annotations.readOnlyHint, false);
-  }
-
-  const called = await handler(event({
-    body: {
-      jsonrpc: "2.0",
-      id: 3,
-      method: "tools/call",
-      params: { name: "create_event", arguments: { title: "private data" } },
-    },
-  }));
-  assert.equal(called.statusCode, 200);
-  assert.equal(calls.length, 2);
+  assert.equal(result.statusCode, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(JSON.parse(calls[0].options.body).method, "resources/list");
 });
 
 test("fails closed when client and Cognito user binding do not match", async () => {

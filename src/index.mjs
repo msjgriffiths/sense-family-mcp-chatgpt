@@ -34,7 +34,6 @@ export const handler = createGateway({
   clientBindings: parseBindings(required("CLIENT_BINDINGS")),
   readScope: process.env.READ_SCOPE ?? "sense-mcp/read",
   writeScope: process.env.WRITE_SCOPE ?? "sense-mcp/write",
-  enableWrites: process.env.ENABLE_WRITES === "true",
   allowedOrigins: (process.env.ALLOWED_ORIGINS ?? "https://chatgpt.com,https://chat.openai.com")
     .split(",")
     .map((value) => value.trim())

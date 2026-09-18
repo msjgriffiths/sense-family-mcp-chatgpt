@@ -10,10 +10,9 @@ ChatGPT authenticates each adult through Amazon Cognito, the gateway validates
 the resulting access token, and only then does it substitute the encrypted
 Sense key for the upstream request.
 
-The reference deployment has been tested end to end with ChatGPT Pro. OAuth
-code exchange and the upstream `tools/list` call succeeded, and ChatGPT
-discovered all twelve allowed actions. No calendar or reminder record was read
-or changed during that verification.
+The reference deployment has been tested end to end with ChatGPT Pro. The
+gateway forwards the complete upstream MCP tool catalog, adding only the OAuth
+metadata ChatGPT needs. It does not maintain a tool-name allowlist.
 
 > [!IMPORTANT]
 > This is a private family-data gateway, not a public proxy. Deploy your own
@@ -37,7 +36,7 @@ ChatGPT account B ── OAuth + PKCE ──┘          │
                                       - validates JWT claims
                                       - binds client to user
                                       - enforces scopes
-                                      - filters MCP tools
+                                      - proxies the complete MCP surface
                                       - selects encrypted key
                                                │
                                                │ Sense bearer key
@@ -64,7 +63,8 @@ the Lambda remains the authentication and authorization boundary.
   CloudFormation template, Git history, Lambda environment, or application
   logs.
 - The inbound ChatGPT access token is never forwarded to Sense.
-- Both advertised tools and guessed `tools/call` requests are allowlisted.
+- Every authenticated MCP method and tool is forwarded to the fixed Sense
+  endpoint, so new Sense capabilities appear without a gateway code change.
 - Request bodies, response bodies, calendar content, names, OAuth codes, and
   credentials are excluded from logs. Logs expire after seven days.
 - Lambda reserved concurrency is capped at five.
@@ -76,29 +76,13 @@ protected-resource metadata, authorization-server metadata, resource
 indicators, PKCE, exact redirect URIs, audience validation, and per-request
 token verification.
 
-## Allowed actions
+## Proxied actions
 
-Read actions:
-
-- `get_family_members`
-- `get_events`
-- `search_events`
-- `get_reminders`
-- `search_reminders`
-- `get_reminder_by_id`
-
-Optional write actions:
-
-- `create_event`
-- `update_event`
-- `create_reminder`
-- `create_reminders`
-- `update_reminder`
-- `complete_reminder`
-
-Delete, account, billing, family-management, import, bulk-mutation, and other
-Sense tools remain blocked. Write actions are enabled only when the stack is
-deployed with `-EnableWrites true`.
+All tools returned by Sense's `tools/list` response are returned to ChatGPT,
+including calendar, reminder, recipe, meal-planning, list, and administrative
+tools. Calls are forwarded without a static name filter. Both OAuth scopes are
+required for the private full-access connection; normal ChatGPT action-time
+confirmations still apply to consequential operations.
 
 ## Prerequisites
 
@@ -203,15 +187,14 @@ same encrypted parameter:
 The source key file should remain outside the repository and be deleted or
 secured after upload.
 
-### 5. Enable the desired action set
-
-Read-only is the deployment default. To expose the six reviewed write actions:
+### 5. Deploy updates
 
 ```powershell
-.\scripts\deploy.ps1 -EnableWrites true
+.\scripts\deploy.ps1
 ```
 
-This does not expose Sense deletion or administrative actions.
+The deployment always advertises both `/mcp/read` and `/mcp/write` because the
+gateway is a full proxy for its explicitly invited family users.
 
 ## Connect ChatGPT
 
@@ -222,7 +205,7 @@ Repeat this process separately in each ChatGPT account:
 3. Select **Server URL** and enter the stack's `McpUrl` output.
 4. Select **OAuth**.
 5. Open **Advanced OAuth settings** and confirm that the discovered scopes end
-   with `/mcp/read` and, when enabled, `/mcp/write`.
+   with `/mcp/read` and `/mcp/write`.
 6. Choose **User-Defined OAuth Client** and enter the matching
    `PrimaryClientId` or `PartnerClientId` CloudFormation output.
 7. Keep the token endpoint authentication method set to `none`.

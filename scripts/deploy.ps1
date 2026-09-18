@@ -9,9 +9,7 @@ param(
     [string]$PartnerCallbackUrl = 'https://chatgpt.com/',
     [string]$PrimaryKeyParameter = '/sense-mcp/primary/key',
     [string]$PartnerKeyParameter = '/sense-mcp/partner/key',
-    [string]$BudgetEmail = '',
-    [ValidateSet('false', 'true')]
-    [string]$EnableWrites = 'false'
+    [string]$BudgetEmail = ''
 )
 
 $primaryCallbackProvided = $PSBoundParameters.ContainsKey('PrimaryCallbackUrl')
@@ -19,14 +17,11 @@ $partnerCallbackProvided = $PSBoundParameters.ContainsKey('PartnerCallbackUrl')
 $primaryKeyParameterProvided = $PSBoundParameters.ContainsKey('PrimaryKeyParameter')
 $partnerKeyParameterProvided = $PSBoundParameters.ContainsKey('PartnerKeyParameter')
 $budgetEmailProvided = $PSBoundParameters.ContainsKey('BudgetEmail')
-$enableWritesProvided = $PSBoundParameters.ContainsKey('EnableWrites')
 $mcpResourceUrlProvided = $PSBoundParameters.ContainsKey('McpResourceUrl')
 
 $ErrorActionPreference = 'Stop'
-$aws = 'C:\Program Files\Amazon\AWSCLIV2\aws.exe'
-if (-not (Test-Path -LiteralPath $aws)) {
-    throw "AWS CLI was not found at $aws"
-}
+$aws = Get-Command aws -ErrorAction SilentlyContinue
+if (-not $aws) { throw 'AWS CLI was not found' }
 
 Push-Location (Split-Path -Parent $PSScriptRoot)
 try {
@@ -74,10 +69,6 @@ try {
         if (-not $budgetEmailProvided) {
             $existing = $currentParameters | Where-Object ParameterKey -eq 'BudgetEmail'
             if ($existing) { $BudgetEmail = $existing.ParameterValue }
-        }
-        if (-not $enableWritesProvided) {
-            $existing = $currentParameters | Where-Object ParameterKey -eq 'EnableWrites'
-            if ($existing) { $EnableWrites = $existing.ParameterValue }
         }
     }
 
@@ -139,8 +130,7 @@ try {
         "PartnerCallbackUrl=$PartnerCallbackUrl",
         "PrimaryKeyParameter=$PrimaryKeyParameter",
         "PartnerKeyParameter=$PartnerKeyParameter",
-        "BudgetEmail=$BudgetEmail",
-        "EnableWrites=$EnableWrites"
+        "BudgetEmail=$BudgetEmail"
     )
 
     & $aws cloudformation deploy `

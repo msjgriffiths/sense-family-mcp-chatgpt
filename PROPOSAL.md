@@ -1,14 +1,10 @@
 # Sense MCP to ChatGPT Cloud
 
-Status: Infrastructure deployed in AWS `us-east-2`, 2026-09-11. The OAuth
-gateway, invite-only Cognito users, private artifact storage, $1 budget alert,
-six read tools, and six reviewed non-delete write tools are live. The primary
-ChatGPT account is connected end to end: OAuth token exchange and the upstream
-Sense `tools/list` call both returned `200`, and ChatGPT displays all twelve
-allowed actions with URL-bound scopes. Both adult OAuth clients currently map
-to the same encrypted family Sense key. No calendar or reminder record was
-read or changed during verification. The partner ChatGPT account still needs
-its own app installation and exact callback URL.
+Status: Infrastructure deployed in AWS `us-east-2`, 2026-09-11. On 2026-09-17
+the original narrow tool allowlist was superseded by the intended full-proxy
+policy. The OAuth gateway now returns and forwards the complete upstream Sense
+MCP surface for the explicitly invited family users. Both adult OAuth clients
+currently map to the same encrypted family Sense key.
 
 ## Recommendation
 
@@ -25,7 +21,7 @@ Wife's ChatGPT Pro ─────OAuth─┘                                   
                                                         Lambda Function URL
                                                         - validate token
                                                         - map user to key
-                                                        - filter tools
+                                                        - proxy all MCP methods/tools
                                                         - suppress content logs
                                                                    │
                                                                    │ Bearer <person's Sense key>
@@ -35,10 +31,9 @@ Wife's ChatGPT Pro ─────OAuth─┘                                   
 
 Use one Cognito identity and OAuth client per adult. Prefer one Sense API key
 per adult when Sense supports that cleanly; otherwise intentionally map both
-clients to the shared family key. The deployed gateway exposes six read tools
-and six narrowly reviewed non-delete write tools. Actual record mutations still
-require normal ChatGPT confirmation and should be tested with a clearly labeled
-temporary event.
+clients to the shared family key. The deployed gateway exposes the complete
+Sense MCP surface. Consequential actions still require normal ChatGPT
+confirmation.
 
 Do not deploy an unauthenticated proxy with a secret URL. Do not forward ChatGPT's OAuth token to Sense. Do not put Lambda in a VPC, because the NAT gateway would dominate the cost.
 
@@ -107,11 +102,14 @@ Behavior:
 2. On a missing or invalid token, return `401` plus a standards-compliant `WWW-Authenticate: Bearer resource_metadata="..."` header.
 3. Validate JWT signature, issuer, expiry, token type, audience, app client, user `sub`, and scopes.
 4. Map the Cognito `sub` to that person's encrypted Sense API key.
-5. Parse only enough JSON-RPC to enforce the tool and scope allowlists.
+5. Parse only enough JSON-RPC for validation and safe audit metadata; do not
+   filter upstream methods or tool names.
 6. Replace the inbound authorization header with the selected Sense bearer key and forward the request to the trailing-slash Sense endpoint.
 7. Return the upstream JSON-RPC response while preserving the safe MCP/content headers.
 
-For `tools/list`, filter out all non-allowed tools and add OAuth `securitySchemes`. Preserve `readOnlyHint` and add accurate `destructiveHint` and `idempotentHint` annotations where applicable. For `tools/call`, reject a tool not in the allowlist even if a caller guesses its name.
+For `tools/list`, preserve every upstream tool and annotation while adding the
+gateway OAuth `securitySchemes`. Forward every authenticated `tools/call`,
+including tools that Sense adds later.
 
 The function must never log request bodies, response bodies, authorization headers, calendar fields, names, or API keys. Log only a request ID, a pseudonymous user identifier, JSON-RPC method/tool name, status, duration, and byte counts. Set log retention to seven days.
 
@@ -139,37 +137,17 @@ At family traffic, expected running cost is effectively $0 and should remain pen
 | Domain, API Gateway, load balancer, NAT gateway | Not used |
 | Optional Secrets Manager | $0.40 per stored secret/month |
 
-Set Lambda reserved concurrency to 5 and an AWS Budget alert at $1/month. Do not enable provisioned concurrency. The random Function URL plus JWT validation is not the security boundary, but it reduces casual scanning; Cognito validation and the allowlists are the security boundaries.
+Set Lambda reserved concurrency to 5 and an AWS Budget alert at $1/month. Do not enable provisioned concurrency. The random Function URL plus JWT validation is not the security boundary, but it reduces casual scanning; Cognito validation, client/user binding, the fixed upstream endpoint, and server-side key substitution are the security boundaries.
 
 Pricing references: [Cognito](https://aws.amazon.com/cognito/pricing/), [Lambda](https://aws.amazon.com/lambda/pricing/), [Systems Manager](https://aws.amazon.com/systems-manager/pricing/), and [CloudWatch](https://aws.amazon.com/cloudwatch/pricing/).
 
-## Tool rollout
+## Tool proxy policy
 
-### Phase 1: read-only
-
-Expose only:
-
-- `get_family_members`
-- `get_events`
-- `search_events`
-- `get_reminders`
-- `search_reminders`
-- `get_reminder_by_id`
-
-Use a Sense token scoped `read` if the Sense UI permits it. Keep forwarded-email, recent-conversation, calendar-feed-URL, medical/family-memory, and all mutation tools hidden.
-
-### Phase 2: low-risk writes
-
-After Phase 1 passes, consider:
-
-- `create_event`
-- `update_event`
-- `create_reminder`
-- `create_reminders`
-- `update_reminder`
-- `complete_reminder`
-
-Keep deletion, bulk cleanup, allowance, memory, rules, email extraction, external-calendar import, and account/settings tools off until there is a concrete use case and a separate review.
+Expose the complete upstream `tools/list` response. Do not duplicate Sense's
+tool catalog in this repository: a static list becomes stale and prevents new
+features such as recipes and meal planning from reaching ChatGPT. Both OAuth
+scopes are required because this is a private, full-access proxy rather than a
+read-only public integration.
 
 ## Per-person Sense identity matters
 
@@ -191,31 +169,32 @@ OpenAI's documentation is currently inconsistent:
 - The current developer-mode guide says Pro and Plus are eligible and says developer mode can use all exposed tools, including writes.
 - The Help Center article says Pro can connect read/fetch MCPs, while full write support is limited to Business and Enterprise/Edu.
 
-The signed-in Pro account has Developer mode enabled and successfully scanned
-all six write actions as well as all six reads. This proves discovery and OAuth
-scope negotiation on Pro. A live record mutation has deliberately not been run,
-so ChatGPT's action-time write confirmation and Sense's write result remain to
-be verified with a clearly labeled temporary event.
+The signed-in Pro account has Developer mode enabled and successfully completed
+discovery and OAuth scope negotiation. ChatGPT's action-time confirmations
+remain the user-facing safeguard for consequential tools.
 
 ## Rollout and acceptance tests
 
 1. Revoke the current diagnostic Sense key and create fresh, labeled keys. Prefer one read-only key per adult for Phase 1.
 2. Ask Sense whether they can expose native MCP OAuth with protected-resource metadata, PKCE, resource indicators, and a ChatGPT client. A vendor-native solution would eventually be better than this bridge.
 3. Implement the gateway and Cognito configuration as infrastructure-as-code, without secret values in the template.
-4. Unit-test JWT validation, audience/scope checks, allowlist filtering, header replacement, redaction, and upstream failure handling.
+4. Unit-test JWT validation, audience/scope checks, complete tool passthrough,
+   header replacement, redaction, and upstream failure handling.
 5. Deploy and verify OAuth discovery with MCP Inspector.
 6. The account owner manually enables ChatGPT Developer mode; this is a security setting and should not be automated.
 7. Add the app separately in each ChatGPT account and authenticate as the matching Cognito user.
-8. Confirm that tool scan shows exactly the Phase 1 list.
+8. Confirm that the tool scan matches the complete upstream Sense catalog.
 9. Test date-bounded reads, search, token expiry/refresh, revocation, and one user's inability to see the other user's private event.
 10. Inspect CloudWatch and prove that no event content, names, headers, tokens, or keys were logged.
-11. If Pro allows writes, deploy the Phase 2 scope and create one clearly labeled test event only after reviewing ChatGPT's confirmation payload. Delete it manually in Sense after the test.
+11. Verify one clearly labeled test action only after reviewing ChatGPT's
+    confirmation payload. Delete it manually in Sense after the test.
 
 Release criteria:
 
 - OAuth sign-in and refresh work for both people.
 - Tokens with the wrong issuer, audience, user, client, expiry, or scope fail closed.
-- Only allowlisted tools appear and guessed disallowed calls fail.
+- Every upstream tool appears and newly added tool names pass through without a
+  gateway release.
 - The inbound ChatGPT token is never sent to Sense.
 - Each spouse resolves to the intended Sense identity.
 - No personal content or credentials appear in logs or deployment state.
@@ -224,8 +203,7 @@ Release criteria:
 ## Decision
 
 Keep the deployed AWS Cognito + CloudFront + Lambda bridge. It is working for
-the primary ChatGPT Pro account with both read and narrowly allowed write tools,
-while all delete, administrative, bulk, import, billing, account, and
-family-management actions remain blocked. Finish the partner account's app
-installation, rotate the exposed diagnostic Sense key, and revisit the bridge
-if Sense adds standards-compliant native MCP OAuth.
+both ChatGPT Pro accounts as a private full-access proxy. Keep the Cognito
+identity binding, encrypted per-person key mapping, origin checks, fixed Sense
+upstream, and safe logging controls. Revisit the bridge if Sense adds
+standards-compliant native MCP OAuth.

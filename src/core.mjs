@@ -1,48 +1,5 @@
 import { createHash } from "node:crypto";
 
-export const READ_TOOLS = Object.freeze([
-  "get_family_members",
-  "get_events",
-  "search_events",
-  "get_reminders",
-  "search_reminders",
-  "get_reminder_by_id",
-]);
-
-export const WRITE_TOOLS = Object.freeze([
-  "create_event",
-  "update_event",
-  "create_reminder",
-  "create_reminders",
-  "update_reminder",
-  "complete_reminder",
-]);
-
-const READ_TOOL_SET = new Set(READ_TOOLS);
-const WRITE_TOOL_SET = new Set(WRITE_TOOLS);
-const SAFE_METHODS = new Set([
-  "initialize",
-  "notifications/initialized",
-  "ping",
-  "tools/list",
-  "tools/call",
-]);
-
-const TOOL_ANNOTATIONS = Object.freeze({
-  get_family_members: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-  get_events: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-  search_events: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-  get_reminders: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-  search_reminders: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-  get_reminder_by_id: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-  create_event: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
-  update_event: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
-  create_reminder: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
-  create_reminders: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
-  update_reminder: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
-  complete_reminder: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
-});
-
 function baseHeaders(extra = {}) {
   return {
     "cache-control": "no-store",
@@ -143,22 +100,16 @@ function requestsFrom(value) {
   return [value];
 }
 
-function inspectRpc(value, { enableWrites }) {
+function inspectRpc(value) {
   let representativeMethod = "batch";
   let representativeTool = null;
-  let requiresWrite = false;
 
   for (const message of requestsFrom(value)) {
     if (!message || typeof message !== "object" || Array.isArray(message)) {
       throw new Error("Invalid JSON-RPC request");
     }
     const method = message.method;
-    if (typeof method !== "string" || !SAFE_METHODS.has(method)) {
-      const error = new Error("Method is not allowed by the gateway");
-      error.code = "METHOD_BLOCKED";
-      error.rpcId = message.id ?? null;
-      throw error;
-    }
+    if (typeof method !== "string" || !method) throw new Error("JSON-RPC method is missing");
     representativeMethod = method;
 
     if (method === "tools/call") {
@@ -167,19 +118,10 @@ function inspectRpc(value, { enableWrites }) {
         throw new Error("Tool name is missing");
       }
       representativeTool = toolName;
-      if (READ_TOOL_SET.has(toolName)) continue;
-      if (enableWrites && WRITE_TOOL_SET.has(toolName)) {
-        requiresWrite = true;
-        continue;
-      }
-      const error = new Error("Tool is not allowed by the gateway");
-      error.code = "TOOL_BLOCKED";
-      error.rpcId = message.id ?? null;
-      throw error;
     }
   }
 
-  return { method: representativeMethod, tool: representativeTool, requiresWrite };
+  return { method: representativeMethod, tool: representativeTool };
 }
 
 function jsonRpcError(id, code, message) {
@@ -190,20 +132,14 @@ function scopeSet(claim) {
   return new Set(typeof claim === "string" ? claim.split(/\s+/).filter(Boolean) : []);
 }
 
-function oauthScheme(scope) {
-  return { type: "oauth2", scopes: [scope] };
+function oauthScheme(scopes) {
+  return { type: "oauth2", scopes };
 }
 
 function decorateTool(tool, { readScope, writeScope }) {
-  const isRead = READ_TOOL_SET.has(tool.name);
-  const scope = isRead ? readScope : writeScope;
-  const securitySchemes = [oauthScheme(scope)];
+  const securitySchemes = [oauthScheme([readScope, writeScope])];
   return {
     ...tool,
-    annotations: {
-      ...(tool.annotations ?? {}),
-      ...(TOOL_ANNOTATIONS[tool.name] ?? {}),
-    },
     securitySchemes,
     _meta: {
       ...(tool._meta ?? {}),
@@ -212,20 +148,14 @@ function decorateTool(tool, { readScope, writeScope }) {
   };
 }
 
-function filterToolsPayload(value, config) {
+function decorateToolsPayload(value, config) {
   const transform = (message) => {
     if (!message?.result || !Array.isArray(message.result.tools)) return message;
-    const allowed = new Set([
-      ...READ_TOOLS,
-      ...(config.enableWrites ? WRITE_TOOLS : []),
-    ]);
     return {
       ...message,
       result: {
         ...message.result,
-        tools: message.result.tools
-          .filter((tool) => allowed.has(tool?.name))
-          .map((tool) => decorateTool(tool, config)),
+        tools: message.result.tools.map((tool) => decorateTool(tool, config)),
       },
     };
   };
@@ -279,7 +209,6 @@ export function createGateway({
   clientBindings,
   readScope = "sense-mcp/read",
   writeScope = "sense-mcp/write",
-  enableWrites = false,
   allowedOrigins = ["https://chatgpt.com", "https://chat.openai.com"],
   upstreamUrl = "https://api.getsense.ai/mcp/",
   maxBodyBytes = 262_144,
@@ -293,7 +222,7 @@ export function createGateway({
     throw new Error("cognitoDomain must be an HTTPS URL");
   }
   const oauthDomain = cognitoDomain.replace(/\/$/, "");
-  const config = { enableWrites, readScope, writeScope };
+  const config = { readScope, writeScope };
   const allowedOriginSet = new Set(allowedOrigins);
   const oauthMetadataPaths = new Set([
     "/.well-known/oauth-authorization-server",
@@ -351,7 +280,7 @@ export function createGateway({
             token_endpoint_auth_methods_supported: ["none"],
             revocation_endpoint_auth_methods_supported: ["none"],
             code_challenge_methods_supported: ["S256"],
-            scopes_supported: [readScope, ...(enableWrites ? [writeScope] : [])],
+            scopes_supported: [readScope, writeScope],
           },
           { "cache-control": "public, max-age=300" },
         );
@@ -367,7 +296,7 @@ export function createGateway({
           {
             resource: urls.resource,
             authorization_servers: [urls.authorizationServer],
-            scopes_supported: [readScope, ...(enableWrites ? [writeScope] : [])],
+            scopes_supported: [readScope, writeScope],
             bearer_methods_supported: ["header"],
             resource_name: "Sense family calendar gateway",
             resource_documentation: "https://api.getsense.ai/docs",
@@ -480,7 +409,7 @@ export function createGateway({
         return oauthErrorResponse(
           401,
           { error: "unauthorized" },
-          `Bearer resource_metadata="${urls.metadata}", scope="${readScope}"`,
+          `Bearer resource_metadata="${urls.metadata}", scope="${readScope} ${writeScope}"`,
           urls,
         );
       }
@@ -519,30 +448,23 @@ export function createGateway({
       }
 
       try {
-        rpc = inspectRpc(parsed.value, { enableWrites });
+        rpc = inspectRpc(parsed.value);
       } catch (error) {
-        if (error.code === "METHOD_BLOCKED") {
-          mcpFailure(400, "method_blocked", "rpc_method");
-          return jsonRpcError(error.rpcId, -32601, "Method not allowed by gateway");
-        }
-        if (error.code === "TOOL_BLOCKED") {
-          mcpFailure(400, "tool_blocked", "rpc_tool");
-          return jsonRpcError(error.rpcId, -32601, "Tool not allowed by gateway");
-        }
         mcpFailure(400, "invalid_request", "rpc_parse");
         return jsonRpcError(null, -32600, "Invalid Request");
       }
 
       const scopes = scopeSet(claims.scope);
-      const requiredScope = rpc.requiresWrite ? writeScope : readScope;
-      if (!scopes.has(requiredScope)) {
+      const requiredScopes = [readScope, writeScope];
+      const missingScopes = requiredScopes.filter((scope) => !scopes.has(scope));
+      if (missingScopes.length) {
         mcpFailure(403, "insufficient_scope", "scope", {
-          required_scope: requiredScope,
+          required_scope: requiredScopes.join(" "),
         });
         return oauthErrorResponse(
           403,
           { error: "insufficient_scope" },
-          `Bearer error="insufficient_scope", scope="${requiredScope}", resource_metadata="${urls.metadata}"`,
+          `Bearer error="insufficient_scope", scope="${requiredScopes.join(" ")}", resource_metadata="${urls.metadata}"`,
           urls,
         );
       }
@@ -575,7 +497,7 @@ export function createGateway({
       let upstreamBody = await upstream.text();
       if (rpc.method === "tools/list" && upstream.ok) {
         try {
-          upstreamBody = JSON.stringify(filterToolsPayload(JSON.parse(upstreamBody), config));
+          upstreamBody = JSON.stringify(decorateToolsPayload(JSON.parse(upstreamBody), config));
         } catch {
           mcpFailure(502, "unsafe_upstream_response", "tools_list_parse");
           return response(502, { error: "unsafe_upstream_response" });
